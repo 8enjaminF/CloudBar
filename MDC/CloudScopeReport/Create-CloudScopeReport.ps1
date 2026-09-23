@@ -1,3 +1,4 @@
+#Requires -Version 5.1
 [CmdletBinding()]
 param(
     [Parameter(Mandatory = $true)]
@@ -9,7 +10,7 @@ param(
 #   Zone.Read.All                  - read the cloud scopes (zones) + environments
 #   RoleManagement.Read.Defender   - read the role assignments and definitions
 #   Directory.Read.All             - resolve user/group ids to names
-#   Azure: RBAC read access (e.g. "Reader") on the attached management groups / subscriptions
+#   Azure: RBAC read access on the attached management groups / subscriptions
 
 if (Get-Module Az.Accounts) {
     throw "Az.Accounts is already loaded in this session - its auth assemblies break the Graph login. Open a NEW PowerShell window and run the script there."
@@ -22,7 +23,7 @@ if (-not (Get-Command Connect-MgGraph -ErrorAction SilentlyContinue)) {
 }
 
 $scopes = @("Zone.Read.All", "RoleManagement.Read.Defender", "Directory.Read.All")
-Connect-MgGraph -TenantId $TenantId -Scopes $scopes -NoWelcome -ErrorAction Stop
+Connect-MgGraph -TenantId $TenantId -Scopes $scopes -ContextScope Process -NoWelcome -ErrorAction Stop
 
 $ctx = Get-MgContext
 if (-not $ctx -or -not $ctx.Account) {
@@ -53,18 +54,17 @@ function Get-AllPages {
     return $results
 }
 
-# Az.Accounts and the Graph module cannot share one session (their auth
-# assemblies clash), so the ARM token comes from a helper process.
+# Az.Accounts and the Graph module cannot share one session (their auth assemblies clash), so the ARM token comes from a helper process.
 function Get-ArmToken {
     param(
         [Parameter(Mandatory = $true)]
         [string]$TenantId
     )
 
-    # handover via temp file instead of console output, so the token never
-    # lands in PowerShell transcription logs
-    $tokenFile = Join-Path $env:TEMP ("armtoken_" + [guid]::NewGuid().ToString("N") + ".tmp")
+    # handover via temp file instead of console output, so the token never lands in PowerShell transcription logs
+    $tokenFile = Join-Path ([IO.Path]::GetTempPath()) ("armtoken_" + [guid]::NewGuid().ToString("N") + ".tmp")
 
+    # single quotes only in the child script - Windows PowerShell 5.1 strips double quotes from -Command arguments
     $childScript = @'
 Import-Module Az.Accounts
 $ctx = Get-AzContext -ErrorAction SilentlyContinue
@@ -76,21 +76,24 @@ $plain = $t.Token
 if ($plain -is [System.Security.SecureString]) {
     $plain = [System.Net.NetworkCredential]::new('', $plain).Password
 }
-Set-Content -Path '__TOKENFILE__' -Value $plain -NoNewline
+Set-Content -LiteralPath '__TOKENFILE__' -Value $plain -NoNewline
 '@
-    $childScript = $childScript.Replace('__TENANT__', $TenantId).Replace('__TOKENFILE__', $tokenFile)
+    # '' escapes apostrophes in the path
+    $childScript = $childScript.Replace('__TENANT__', $TenantId).Replace('__TOKENFILE__', $tokenFile.Replace("'", "''"))
 
-    $shell = "powershell"
-    if (Get-Command pwsh -ErrorAction SilentlyContinue) {
-        $shell = "pwsh"
+    # same executable as the parent
+    $shell = (Get-Process -Id $PID).Path
+    if (-not $shell -or (Split-Path $shell -Leaf) -notmatch '^(pwsh|powershell)(\.exe)?$') {
+        $shell = if ($PSVersionTable.PSEdition -eq "Core") { "pwsh" } else { "powershell" }
     }
 
     try {
-        & $shell -NoProfile -Command $childScript | Out-Null
+        # Out-Host: Az prompts, warnings and CA errors stay visible
+        & $shell -NoProfile -Command $childScript | Out-Host
 
         $token = $null
-        if (Test-Path $tokenFile) {
-            $token = "$(Get-Content -Path $tokenFile -Raw)".Trim()
+        if (Test-Path -LiteralPath $tokenFile) {
+            $token = "$(Get-Content -LiteralPath $tokenFile -Raw)".Trim()
         }
         if (-not $token) {
             throw "Could not get an ARM access token (Azure login in the helper process failed)."
@@ -98,7 +101,7 @@ Set-Content -Path '__TOKENFILE__' -Value $plain -NoNewline
         return $token
     }
     finally {
-        Remove-Item -Path $tokenFile -Force -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath $tokenFile -Force -ErrorAction SilentlyContinue
     }
 }
 
@@ -366,189 +369,201 @@ function Resolve-Environment {
     return $node
 }
 
-Write-Host "Getting Azure (ARM) access token..." -ForegroundColor Cyan
-$script:ArmToken = Get-ArmToken -TenantId $TenantId
-Write-Host "Got ARM token" -ForegroundColor Green
+try {
+    Write-Host "Getting Azure (ARM) access token..." -ForegroundColor Cyan
+    $script:ArmToken = Get-ArmToken -TenantId $TenantId
+    Write-Host "Got ARM token" -ForegroundColor Green
 
-Write-Host "Getting zones..." -ForegroundColor Cyan
-$zones = Get-AllPages -Url "https://graph.microsoft.com/beta/security/zones"
-Write-Host "Found $($zones.Count) zones"
+    Write-Host "Getting zones..." -ForegroundColor Cyan
+    $zones = Get-AllPages -Url "https://graph.microsoft.com/beta/security/zones"
+    Write-Host "Found $($zones.Count) zones"
 
-Write-Host "Getting role assignments..." -ForegroundColor Cyan
-$assignments = Get-AllPages -Url "https://graph.microsoft.com/beta/roleManagement/defender/roleAssignments"
-Write-Host "Found $($assignments.Count) assignments"
+    Write-Host "Getting role assignments..." -ForegroundColor Cyan
+    $assignments = Get-AllPages -Url "https://graph.microsoft.com/beta/roleManagement/defender/roleAssignments"
+    Write-Host "Found $($assignments.Count) assignments"
 
-$roleDefLookup = @{}
+    $roleDefLookup = @{}
 
-foreach ($assignment in $assignments) {
-    $defId = $assignment.roleDefinitionId
+    foreach ($assignment in $assignments) {
+        $defId = $assignment.roleDefinitionId
 
-    if ($roleDefLookup.ContainsKey($defId)) {
-        continue
-    }
-
-    try {
-        $url = "https://graph.microsoft.com/beta/roleManagement/defender/roleDefinitions/$defId"
-        $def = Invoke-MgGraphRequest -Method GET -Uri $url -ErrorAction Stop
-        $roleDefLookup[$defId] = $def
-    } catch {
-        Write-Warning "Could not fetch role definition $defId"
-        $roleDefLookup[$defId] = [pscustomobject]@{
-            displayName = "(unknown role)"
-            rolePermissions = @()
-        }
-    }
-}
-
-$principalLookup = @{}
-
-foreach ($assignment in $assignments) {
-    foreach ($principalId in $assignment.principalIds) {
-
-        if ($principalLookup.ContainsKey($principalId)) {
+        if ($roleDefLookup.ContainsKey($defId)) {
             continue
         }
+
         try {
-            $url = "https://graph.microsoft.com/v1.0/directoryObjects/$principalId"
-            $obj = Invoke-MgGraphRequest -Method GET -Uri $url -ErrorAction Stop
-
-            $type = $obj.'@odata.type' -replace '#microsoft.graph.', ''
-
-            $name = $obj.displayName
-            if (-not $name) {
-                $name = $obj.userPrincipalName
+            $url = "https://graph.microsoft.com/beta/roleManagement/defender/roleDefinitions/$defId"
+            $def = Invoke-MgGraphRequest -Method GET -Uri $url -ErrorAction Stop
+            $roleDefLookup[$defId] = $def
+        } catch {
+            Write-Warning "Could not fetch role definition $defId"
+            $roleDefLookup[$defId] = [pscustomobject]@{
+                displayName = "(unknown role)"
+                rolePermissions = @()
             }
-            if (-not $name) {
-                $name = "(unknown)"
-            }
+        }
+    }
 
-            $principalLookup[$principalId] = [ordered]@{
-                id          = $principalId
-                displayName = $name
-                type        = $type
+    $principalLookup = @{}
+
+    foreach ($assignment in $assignments) {
+        foreach ($principalId in $assignment.principalIds) {
+
+            if ($principalLookup.ContainsKey($principalId)) {
+                continue
+            }
+            try {
+                $url = "https://graph.microsoft.com/v1.0/directoryObjects/$principalId"
+                $obj = Invoke-MgGraphRequest -Method GET -Uri $url -ErrorAction Stop
+
+                $type = $obj.'@odata.type' -replace '#microsoft.graph.', ''
+
+                $name = $obj.displayName
+                if (-not $name) {
+                    $name = $obj.userPrincipalName
+                }
+                if (-not $name) {
+                    $name = "(unknown)"
+                }
+
+                $principalLookup[$principalId] = [ordered]@{
+                    id          = $principalId
+                    displayName = $name
+                    type        = $type
+                }
+            }
+            catch {
+                $principalLookup[$principalId] = [ordered]@{
+                    id          = $principalId
+                    displayName = "(could not resolve)"
+                    type        = "unknown"
+                }
+            }
+        }
+    }
+
+    Write-Host "Getting environments and their contents..." -ForegroundColor Cyan
+    $environmentsByZone = @{}
+    foreach ($zone in $zones) {
+        Write-Host "Scope: $($zone.displayName)" -ForegroundColor White
+        $resolved = @()
+        try {
+            $url = "https://graph.microsoft.com/beta/security/zones/$($zone.id)/environments"
+            $environments = Get-AllPages -Url $url
+            foreach ($environment in $environments) {
+                $resolved += Resolve-Environment -Environment $environment
             }
         }
         catch {
-            $principalLookup[$principalId] = [ordered]@{
-                id          = $principalId
-                displayName = "(could not resolve)"
-                type        = "unknown"
+            Write-Warning "Could not fetch environments for zone $($zone.displayName) ($($zone.id))"
+        }
+        $environmentsByZone[$zone.id] = $resolved
+    }
+
+    $scopeObjects = @()
+
+    foreach ($zone in $zones) {
+
+        $zoneAssignments = @()
+
+        foreach ($assignment in $assignments) {
+
+            $cloudSetIds = $assignment.appScopeIds | Where-Object { $_ -like '/CloudSet/*' }
+            $sentinelIds = $assignment.appScopeIds | Where-Object { $_ -like '/SentinelScope/*' }
+
+            if ($cloudSetIds) {
+                $applies = $cloudSetIds -contains "/CloudSet/$($zone.id)"
+                $appliesVia = "Cloud scope"
             }
-        }
-    }
-}
+            elseif ($sentinelIds) {
+                $applies = $false
+                $appliesVia = ""
+            }
+            else {
+                $applies = $true
+                $appliesVia = "Tenant-wide"
+            }
+            if (-not $applies) {
+                continue
+            }
 
-Write-Host "Getting environments and their contents..." -ForegroundColor Cyan
-$environmentsByZone = @{}
-foreach ($zone in $zones) {
-    Write-Host "Scope: $($zone.displayName)" -ForegroundColor White
-    $resolved = @()
-    try {
-        $url = "https://graph.microsoft.com/beta/security/zones/$($zone.id)/environments"
-        $environments = Get-AllPages -Url $url
-        foreach ($environment in $environments) {
-            $resolved += Resolve-Environment -Environment $environment
-        }
-    }
-    catch {
-        Write-Warning "Could not fetch environments for zone $($zone.displayName) ($($zone.id))"
-    }
-    $environmentsByZone[$zone.id] = $resolved
-}
+            $roleDef = $roleDefLookup[$assignment.roleDefinitionId]
 
-$scopeObjects = @()
+            $principals = @()
+            foreach ($principalId in $assignment.principalIds) {
+                $principals += $principalLookup[$principalId]
+            }
 
-foreach ($zone in $zones) {
+            $permissions = @()
+            foreach ($rp in $roleDef.rolePermissions) {
+                foreach ($action in $rp.allowedResourceActions) {
+                    $permissions += $action
+                }
+            }
 
-    $zoneAssignments = @()
-
-    foreach ($assignment in $assignments) {
-
-        $cloudSetIds = $assignment.appScopeIds | Where-Object { $_ -like '/CloudSet/*' }
-        $sentinelIds = $assignment.appScopeIds | Where-Object { $_ -like '/SentinelScope/*' }
-
-        if ($cloudSetIds) {
-            $applies = $cloudSetIds -contains "/CloudSet/$($zone.id)"
-            $appliesVia = "Cloud scope"
-        }
-        elseif ($sentinelIds) {
-            $applies = $false
-            $appliesVia = ""
-        }
-        else {
-            $applies = $true
-            $appliesVia = "Tenant-wide"
-        }
-        if (-not $applies) {
-            continue
-        }
-
-        $roleDef = $roleDefLookup[$assignment.roleDefinitionId]
-
-        $principals = @()
-        foreach ($principalId in $assignment.principalIds) {
-            $principals += $principalLookup[$principalId]
-        }
-
-        $permissions = @()
-        foreach ($rp in $roleDef.rolePermissions) {
-            foreach ($action in $rp.allowedResourceActions) {
-                $permissions += $action
+            $zoneAssignments += [ordered]@{
+                name        = $assignment.displayName
+                role        = $roleDef.displayName
+                appliesVia  = $appliesVia
+                principals  = $principals
+                permissions = @($permissions | Sort-Object)
             }
         }
 
-        $zoneAssignments += [ordered]@{
-            name        = $assignment.displayName
-            role        = $roleDef.displayName
-            appliesVia  = $appliesVia
-            principals  = $principals
-            permissions = @($permissions | Sort-Object)
+        $scopeObjects += [ordered]@{
+            id           = $zone.id
+            name         = $zone.displayName
+            description  = "$($zone.description)"
+            environments = @($environmentsByZone[$zone.id])
+            assignments  = @($zoneAssignments | Sort-Object { $_.role }, { $_.name })
         }
     }
 
-    $scopeObjects += [ordered]@{
-        id           = $zone.id
-        name         = $zone.displayName
-        description  = "$($zone.description)"
-        environments = @($environmentsByZone[$zone.id])
-        assignments  = @($zoneAssignments | Sort-Object { $_.role }, { $_.name })
+    $reportData = [ordered]@{
+        generatedAt = (Get-Date).ToString("o")
+        tenantId    = $TenantId
+        account     = "$($ctx.Account)"
+        scopes      = $scopeObjects
     }
-}
 
-$reportData = [ordered]@{
-    generatedAt = (Get-Date).ToString("o")
-    tenantId    = $TenantId
-    account     = "$($ctx.Account)"
-    scopes      = $scopeObjects
-}
-
-Write-Host ""
-Write-Host "=====================================" -ForegroundColor Yellow
-Write-Host "          SUMMARY" -ForegroundColor Yellow
-Write-Host "=====================================" -ForegroundColor Yellow
-foreach ($scope in $scopeObjects) {
     Write-Host ""
-    Write-Host "Scope: $($scope.name)" -ForegroundColor Green
-    Write-Host "  Environments: $($scope.environments.Count)"
-    Write-Host "  Assignments:  $($scope.assignments.Count)"
+    Write-Host "=====================================" -ForegroundColor Yellow
+    Write-Host "          SUMMARY" -ForegroundColor Yellow
+    Write-Host "=====================================" -ForegroundColor Yellow
+    foreach ($scope in $scopeObjects) {
+        Write-Host ""
+        Write-Host "Scope: $($scope.name)" -ForegroundColor Green
+        Write-Host "  Environments: $($scope.environments.Count)"
+        Write-Host "  Assignments:  $($scope.assignments.Count)"
+    }
+    $totalResources = 0
+    foreach ($sub in $subscriptionCache.Values) {
+        $totalResources += $sub.resourceCount
+    }
+    Write-Host ""
+    Write-Host "Resolved $($subscriptionCache.Count) subscriptions with $totalResources resources total"
+
+    $dateStamp = Get-Date -Format 'yyyy-MM-dd'
+    # $PSScriptRoot is empty when the script is run as a string (e.g. iex) - fall back to the current directory
+    $outDir = $PSScriptRoot
+    if (-not $outDir) {
+        $outDir = (Get-Location).Path
+    }
+    $jsonPath = Join-Path $outDir "CloudScopeReport_$dateStamp.json"
+
+    $json = ConvertTo-Json -InputObject $reportData -Depth 100
+    # UTF-8 without BOM in both PowerShell editions (Out-File -Encoding utf8 adds a BOM on 5.1)
+    [IO.File]::WriteAllText($jsonPath, $json, [Text.UTF8Encoding]::new($false))
+    Write-Host ""
+    Write-Host "JSON saved to: $jsonPath" -ForegroundColor Green
+    Write-Host "View it by opening ReportViewer.html in a browser and clicking 'Load JSON...'"
+
+    Write-Host ""
+    Write-Host "Done" -ForegroundColor Green
 }
-$totalResources = 0
-foreach ($sub in $subscriptionCache.Values) {
-    $totalResources += $sub.resourceCount
+
+#cleanup and forcing disconnect
+finally {
+    Disconnect-MgGraph -ErrorAction SilentlyContinue | Out-Null
+    Remove-Variable -Name ArmToken -Scope Script -ErrorAction SilentlyContinue
 }
-Write-Host ""
-Write-Host "Resolved $($subscriptionCache.Count) subscriptions with $totalResources resources total"
-
-$dateStamp = Get-Date -Format 'yyyy-MM-dd'
-$jsonPath = Join-Path $PSScriptRoot "CloudScopeReport_$dateStamp.json"
-
-$json = ConvertTo-Json -InputObject $reportData -Depth 100
-$json | Out-File -FilePath $jsonPath -Encoding utf8
-Write-Host ""
-Write-Host "JSON saved to: $jsonPath" -ForegroundColor Green
-Write-Host "View it by opening ReportViewer.html in a browser and clicking 'Load JSON...'"
-
-Write-Host ""
-Write-Host "Done" -ForegroundColor Green
-
-Disconnect-MgGraph | Out-Null
