@@ -41,7 +41,7 @@
   }
 
   * { box-sizing: border-box; }
-  body { margin: 0; background: var(--page); color: var(--ink); font: 14px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif; }
+  body { margin: 0; min-height: 100vh; display: flex; flex-direction: column; background: var(--page); color: var(--ink); font: 14px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif; }
 
   header {
     display: flex;
@@ -70,8 +70,8 @@
   }
   #loadBtn:hover { border-color: var(--muted); }
 
-  main { display: flex; align-items: stretch; }
-  aside { width: 290px; flex: none; border-right: 1px solid var(--line); padding: 12px; min-height: calc(100vh - 55px); }
+  main { display: flex; align-items: stretch; flex: 1; }
+  aside { width: 290px; flex: none; border-right: 1px solid var(--line); padding: 12px; }
   aside h2, section h2 {
     font-size: 11px;
     letter-spacing: 0.08em;
@@ -200,7 +200,6 @@
     padding: 2px 9px;
     vertical-align: middle;
   }
-  .plist { display: flex; flex-wrap: wrap; gap: 6px; }
 
   .assign {
     background: var(--page);
@@ -345,13 +344,27 @@ document.getElementById("fileInput").addEventListener("change", function (e) {
     if (!file) return;
     const reader = new FileReader();
     reader.onload = function () {
+        let parsed;
         try {
-            data = JSON.parse(reader.result);
-            selectedScopeId = null;
-            render();
+            parsed = JSON.parse(reader.result);
         } catch (err) {
             alert("Could not parse that file as JSON: " + err.message);
+            return;
         }
+        if (!parsed || !Array.isArray(parsed.scopes)) {
+            alert("That file is not a Cloud Scope report (no \"scopes\" list in it).");
+            return;
+        }
+        data = parsed;
+        selectedScopeId = null;
+        try {
+            render();
+        } catch (err) {
+            alert("Could not render that report: " + err.message);
+        }
+    };
+    reader.onerror = function () {
+        alert("Could not read that file" + (reader.error ? ": " + reader.error.message : "."));
     };
     reader.readAsText(file);
     e.target.value = "";
@@ -373,7 +386,10 @@ function render() {
 
     const bits = [];
     if (data.tenantId) bits.push("Tenant " + data.tenantId);
-    if (data.generatedAt) bits.push("generated " + new Date(data.generatedAt).toLocaleString());
+    if (data.generatedAt) {
+        const d = new Date(data.generatedAt);
+        bits.push("generated " + (isNaN(d.getTime()) ? data.generatedAt : d.toLocaleString()));
+    }
     if (data.account) bits.push("by " + data.account);
     document.getElementById("meta").textContent = bits.join(" · ");
 
@@ -405,20 +421,24 @@ function renderScopeList() {
 }
 
 function scopeStats(scope) {
-    let mgs = 0, rgs = 0, res = 0;
-    const seen = new Set();
+    let rgs = 0, res = 0;
+    const seenSubs = new Set();
+    const seenMgs = new Set();
 
     function walkSub(sub) {
         if (!sub) return;
         const key = (sub.id || "").toLowerCase();
-        if (seen.has(key)) return;
-        seen.add(key);
+        if (seenSubs.has(key)) return;
+        seenSubs.add(key);
         rgs += (sub.resourceGroups || []).length;
         res += sub.resourceCount || 0;
     }
+    // same de-duplication as subscriptions: a child MG attached on its own also appears inside its parent
     function walkMg(mg) {
         if (!mg) return;
-        mgs++;
+        const key = (mg.id || "").toLowerCase();
+        if (seenMgs.has(key)) return;
+        seenMgs.add(key);
         for (const c of mg.children || []) walkMg(c);
         for (const s of mg.subscriptions || []) walkSub(s);
     }
@@ -427,7 +447,7 @@ function scopeStats(scope) {
         if (env.type === "managementGroup") walkMg(env.managementGroup);
         else if (env.type === "subscription") walkSub(env.subscription);
     }
-    return { envs: (scope.environments || []).length, mgs: mgs, subs: seen.size, rgs: rgs, res: res };
+    return { envs: (scope.environments || []).length, mgs: seenMgs.size, subs: seenSubs.size, rgs: rgs, res: res };
 }
 
 function renderScope(scope) {
@@ -619,7 +639,8 @@ function catNode(cat) {
 }
 
 function resNode(r) {
-  return makeCard({ title: r.name, sub: r.type, tooltip: r.name + " (" + r.type + ", " + r.location + ")" });
+  const info = [r.type, r.location].filter(Boolean).join(", ");
+  return makeCard({ title: r.name, sub: r.type, tooltip: info ? r.name + " (" + info + ")" : r.name });
 }
 
 function errNode(msg) {
@@ -642,15 +663,15 @@ function renderAssignments(scope, container) {
     card.appendChild(el("div", "aname", a.name || ""));
 
     card.appendChild(el("h3", null, "Principals"));
-    // card.appendChild(el("div", "plist"));
-    for (const p of a.principals) {
+    const principals = (a.principals || []).filter(Boolean);
+    for (const p of principals) {
       const row = el("div", "principal");
-      row.appendChild(el("span", null, p.displayName + " [" + p.type + "]"));
-      row.appendChild(el("code", "idtext", p.id));
-      row.appendChild(copyBtn(p.id));
+      row.appendChild(el("span", null, (p.displayName || "(unknown)") + " [" + (p.type || "unknown") + "]"));
+      row.appendChild(el("code", "idtext", p.id || ""));
+      row.appendChild(copyBtn(p.id || ""));
       card.appendChild(row);
     }
-    if (!a.principals.length) card.appendChild(el("div", "none", "(none)"));
+    if (!principals.length) card.appendChild(el("div", "none", "(none)"));
 
     card.appendChild(el("h3", null, "Permissions"));
     const perms = a.permissions || [];
